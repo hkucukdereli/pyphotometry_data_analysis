@@ -3,7 +3,7 @@ from scipy.signal import butter, filtfilt
 import json
 import os
 from typing import Union, List, Dict, Optional
-from copy import deepcopy
+from datetime import datetime
 from scipy.signal import medfilt
 from scipy.stats import linregress, zscore
 from scipy.optimize import curve_fit
@@ -70,7 +70,7 @@ class Photom:
 
         # Apply low-pass filtering
         (self.data['signal_filt'], 
-         self.data['control_filt']) = self.apply_filters([self.data['signal'], self.data['control']], 
+         self.data['control_filt']) = self.apply_filters(['signal', 'control'], 
                                                          sampling_rate = self.sampling_rate, 
                                                          low_pass = self.low_pass, 
                                                          high_pass = self.high_pass
@@ -254,8 +254,19 @@ class Photom:
         return n if n % 2 == 1 else n + 1
 
     def preprocess(self):
-        """Apply all preprocessing steps to the data."""
+        """Apply all preprocessing steps to the data.
+
+        Preprocessing steps:
+        1. Median filtering
+        2. Downsampling
+        3. Photobleaching correction
+        4. Motion correction
+        5. Normalization
+        """
         print("Preprocessing data...")
+
+        # Initialize processing history
+        self.processing_history = []
 
         # Get filtered signals if available
         signal = self.data[f'{self.signal_channel}_filt'] if f'{self.signal_channel}_filt' in self.data else self.data[self.signal_channel]
@@ -271,9 +282,18 @@ class Photom:
         if self.median_filter:
             current_signal = medfilt(current_signal, self._ensure_odd(self.median_filter))
             current_control = medfilt(current_control, self._ensure_odd(self.median_filter))
+
+            # Add filtered signals to data
             self.data.update({
                 'signal_med': current_signal,
                 'control_med': current_control
+            })
+
+            # Update processing history
+            self.processing_history.append({
+                'step': 'median_filter',
+                'kernel_size': self.median_filter,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
 
         # 2. Downsample if needed
@@ -288,10 +308,20 @@ class Photom:
             old_rate = current_sampling_rate
             current_sampling_rate = current_sampling_rate / self.downsample_factor
             
+            # Add downsampled signals to data
             self.data.update({
                 'time': current_time,
                 'original_sampling_rate': old_rate,
                 'sampling_rate': current_sampling_rate
+            })
+
+            # Update processing history
+            self.processing_history.append({
+                'step': 'downsample',
+                'factor': self.downsample_factor,
+                'original_sampling_rate': old_rate,
+                'final_sampling_rate': current_sampling_rate,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
 
             # Downsample digital signals if present
@@ -312,7 +342,7 @@ class Photom:
             sampling_rate = sampling_rate / self.downsample_factor
             self.data['sampling_rate'] = sampling_rate
 
-        # 4. Photobleaching correction if needed
+        # 3. Photobleaching correction if needed
         if self.bleach_correct:
             t = np.arange(len(current_signal)) / current_sampling_rate
             signal_expfit = self._fit_exponential(current_signal, t, current_sampling_rate)
@@ -321,22 +351,38 @@ class Photom:
             current_signal = current_signal - signal_expfit
             current_control = current_control - control_expfit
 
+            # Add bleach-corrected signals to data
             self.data.update({
                 'signal_bc': current_signal,
                 'control_bc': current_control,
                 'signal_expfit': signal_expfit,
                 'control_expfit': control_expfit
             })
+
+            # Update processing history
+            self.processing_history.append({
+                'step': 'bleach correction',
+                'method': 'exponential fit',
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
             
-        # 5. Motion correction if needed
+        # 4. Motion correction if needed
         if self.motion_correct:
             slope, intercept, _, _, _ = linregress(x=current_control, y=current_signal)
             est_motion = intercept + slope * current_control
             current_signal = current_signal - est_motion
             
+            # Add motion-corrected signal to data
             self.data.update({'signal_mc': current_signal})
+
+            # Update processing history
+            self.processing_history.append({
+                'step': 'motion correction',
+                'method': 'linear regression',
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
         
-        # 6. Normalization
+        # 5. Normalization
         if self.normalization == "dF/F":
             # Calculate the baseline
             if 'signal_expfit' in self.data: # Check if we have expfit from bleach correction
@@ -347,6 +393,13 @@ class Photom:
         elif self.normalization == "z-score" or self.normalization == "zscore":
             signal_norm = zscore(current_signal)
             self.data.update({'signal_norm': signal_norm})
+
+        # Update processing history
+        self.processing_history.append({
+            'step': 'normalization',
+            'method': self.normalization,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
 
 ####################
 # Helper functions #
