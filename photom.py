@@ -59,11 +59,11 @@ class Photom:
         # Handle single file path vs list of paths
         if isinstance(file_paths, str):
             self.data, self.metadata = import_ppd(file_paths)
-            self.sampling_rate = self.data['sampling_rate']
+            self.sampling_rate = self.metadata['sampling_rate']
         else:
             # Combine multiple files
             self.data, self.metadata = self._combine_files(file_paths)
-            self.sampling_rate = self.data['sampling_rate']
+            self.sampling_rate = self.metadata['sampling_rate']
 
         self.data['signal'] = self.data[signal_channel]
         self.data['control'] = self.data[control_channel]
@@ -212,8 +212,12 @@ class Photom:
         # Take first time point of each bin
         return time[::self.downsample_factor]
     
-    def _adjust_digital_events(self, event_times: np.ndarray, sampling_rate: float) -> np.ndarray:
+    def _adjust_digital_events(self, event_times: np.ndarray, sampling_rate: float = None) -> np.ndarray:
         """Adjust digital event times after downsampling."""
+        sampling_rate = sampling_rate or self.sampling_rate
+        if sampling_rate <= 0:
+            raise ValueError("Sampling rate must be specified.")
+        
         if self.downsample_factor is None or self.downsample_factor == 1 or event_times is None:
             return event_times
             
@@ -275,7 +279,7 @@ class Photom:
         # Track the latest version of signals
         current_signal = signal
         current_control = control
-        current_sampling_rate = self.data['sampling_rate']
+        current_sampling_rate = self.sampling_rate
         current_time = self.data['time']
 
         # 1. Apply median filtering if needed
@@ -309,6 +313,7 @@ class Photom:
 
             old_rate = current_sampling_rate
             current_sampling_rate = current_sampling_rate / self.downsample_factor
+            self.sampling_rate = current_sampling_rate
             
             # Add downsampled signals to data
             self.data.update({
