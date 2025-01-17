@@ -23,7 +23,7 @@ class Photom:
         bleach_correct: bool = True,
         motion_correct: bool = True,
         normalization: Optional[str] = "dF/F",
-        preprocess: bool = True,
+        preprocess: bool = False,
         timeseries: bool = True,
         as_df: bool = True
     ):
@@ -81,7 +81,6 @@ class Photom:
             self.preprocess()
 
             if as_df:
-                pass
                 if timeseries:
                     pass
                 else:
@@ -432,7 +431,7 @@ def import_metadata(file_path: str) -> Dict:
         
     # Extract header information
     header_dict = json.loads(data_header)
-    header_dict["filename"]: os.path.basename(file_path)
+    header_dict["filename"] = os.path.basename(file_path)
     
     volts_per_division = header_dict["volts_per_division"]
     sampling_rate = header_dict["sampling_rate"]
@@ -461,6 +460,7 @@ def import_ppd(file_path: str) -> Dict:
         
     # Extract header information
     header_dict = json.loads(data_header)
+    header_dict["filename"] = os.path.basename(file_path)
     
     volts_per_division = header_dict["volts_per_division"]
     sampling_rate = header_dict["sampling_rate"]
@@ -501,9 +501,6 @@ def import_ppd(file_path: str) -> Dict:
     
     # Construct output dictionary
     data_dict = {
-        "filename": os.path.basename(file_path),
-        "start_time": header_dict['start_time'],
-        "sampling_rate": sampling_rate,
         "analog_1": analog_1,
         "analog_2": analog_2,
         # "analog_1_filt": analog_1_filt,
