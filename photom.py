@@ -267,6 +267,7 @@ class Photom:
 
         # Initialize processing history
         self.processing_history = []
+        processing_order = 0
 
         # Get filtered signals if available
         signal = self.data[f'{self.signal_channel}_filt'] if f'{self.signal_channel}_filt' in self.data else self.data[self.signal_channel]
@@ -290,7 +291,9 @@ class Photom:
             })
 
             # Update processing history
+            processing_order = processing_order + 1
             self.processing_history.append({
+                'order': processing_order,
                 'step': 'median_filter',
                 'kernel_size': self.median_filter,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -316,7 +319,9 @@ class Photom:
             })
 
             # Update processing history
+            processing_order = processing_order + 1
             self.processing_history.append({
+                'order': processing_order,
                 'step': 'downsample',
                 'factor': self.downsample_factor,
                 'original_sampling_rate': old_rate,
@@ -360,7 +365,9 @@ class Photom:
             })
 
             # Update processing history
+            processing_order = processing_order + 1
             self.processing_history.append({
+                'order': processing_order,
                 'step': 'bleach correction',
                 'method': 'exponential fit',
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -376,7 +383,9 @@ class Photom:
             self.data.update({'signal_mc': current_signal})
 
             # Update processing history
+            processing_order = processing_order + 1
             self.processing_history.append({
+                'order': processing_order,
                 'step': 'motion correction',
                 'method': 'linear regression',
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -395,7 +404,9 @@ class Photom:
             self.data.update({'signal_norm': signal_norm})
 
         # Update processing history
+        processing_order = processing_order + 1
         self.processing_history.append({
+            'order': processing_order,
             'step': 'normalization',
             'method': self.normalization,
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
