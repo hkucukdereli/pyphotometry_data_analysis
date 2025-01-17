@@ -15,13 +15,17 @@ class Photom:
         file_paths: Union[str, List[str]],
         signal_channel: str = "analog_1",
         control_channel: str = "analog_2",
+        low_pass: float = None,
+        high_pass: float = None,
         median_filter: Union[bool, int] = False,
         downsample_factor: Optional[int] = None,
         downsample_method: str = "mean",
-        low_pass: float = 10,
-        high_pass: float = 0.01,
+        bleach_correct: bool = True,
+        motion_correct: bool = True,
         normalization: Optional[str] = "dF/F",
-        preprocess: bool = True
+        preprocess: bool = True,
+        timeseries: bool = True,
+        as_df: bool = True
     ):
         """
         Initialize Photometry analysis object.
@@ -31,33 +35,57 @@ class Photom:
             signal_channel: Key for signal channel (default: "analog_1")
             control_channel: Key for control channel (default: "analog_2")
             median_filter: Width of median filter window in samples, False to disable
-            downsample_factor: Factor by which to downsample the data (e.g., 2 for half the points)
+            downsample_factor: Factor by which to temporally downsample the data
             downsample_method: Method for downsampling - "mean" or "median"
             low_pass: Low pass filter frequency in Hz
             high_pass: High pass filter frequency in Hz
-            normalization: Type of normalization - "dF/F", "z-score", or None
-            preprocess: Whether to preprocess the data (default: True)
+            normalization: Type of normalization - "dF/F", "z-score", "zscore", or None
+            preprocess: Whether to preprocess the data (default: True). If False, only raw and filtered data is stored.
+            timeseries: Whether to return time series data (default: True)
+            as_df: Whether to return data as a DataFrame (default: True)
         """
         assert downsample_method in ["mean", "median"], "downsample_method must be 'mean' or 'median'"
         self.signal_channel = signal_channel
         self.control_channel = control_channel
+        self.low_pass = low_pass
+        self.high_pass = high_pass
         self.median_filter = median_filter
         self.downsample_factor = downsample_factor
         self.downsample_method = downsample_method
-        self.low_pass = low_pass
-        self.high_pass = high_pass
+        self.bleach_correct = bleach_correct
+        self.motion_correct = motion_correct
         self.normalization = normalization
         
         # Handle single file path vs list of paths
         if isinstance(file_paths, str):
             self.data, self.metadata = import_ppd(file_paths)
+            self.sampling_rate = self.data['sampling_rate']
         else:
             # Combine multiple files
             self.data, self.metadata = self._combine_files(file_paths)
-        
+            self.sampling_rate = self.data['sampling_rate']
+
+        self.data['signal'] = self.data[signal_channel]
+        self.data['control'] = self.data[control_channel]
+
+        # Apply low-pass filtering
+        (self.data['signal_filt'], 
+         self.data['control_filt']) = self.apply_filters([self.data['signal'], self.data['control']], 
+                                                         sampling_rate = self.sampling_rate, 
+                                                         low_pass = self.low_pass, 
+                                                         high_pass = self.high_pass
+                                                         )
+
         if preprocess:
             # Preprocess the data
-            self._preprocess()
+            self.preprocess()
+
+            if as_df:
+                pass
+                if timeseries:
+                    pass
+                else:
+                    pass
         else:
             self.processed_data = None
     
@@ -107,28 +135,42 @@ class Photom:
         
         return combined_data
     
-    def _apply_filters(self, signals: List[np.ndarray], sampling_rate: float) -> List[np.ndarray]:
+    def apply_filters(self, 
+                      signals: Union[str, List[str]], 
+                      sampling_rate: float = None, 
+                      low_pass: float = None, 
+                      high_pass: float = None) -> List[np.ndarray]:
         """Apply specified filters to signals."""
+        # Convert single string to list
+        if isinstance(signals, str):
+            signals = [signals]
+
+        sampling_rate = sampling_rate or self.sampling_rate
+        if sampling_rate <= 0:
+            raise ValueError("Sampling rate must be specified.")
+
         filtered_signals = []
-        
-        if self.low_pass and self.high_pass:
-            b, a = butter(2, np.array([self.high_pass, self.low_pass]) / (0.5 * sampling_rate), "bandpass")
-        elif self.low_pass:
-            b, a = butter(2, self.low_pass / (0.5 * sampling_rate), "low")
-        elif self.high_pass:
-            b, a = butter(2, self.high_pass / (0.5 * sampling_rate), "high")
+            
+        if low_pass and high_pass:
+            b, a = butter(2, np.array([high_pass, low_pass]) / (0.5 * sampling_rate), "bandpass")
+        elif low_pass:
+            b, a = butter(2, low_pass / (0.5 * sampling_rate), "low")
+        elif high_pass:
+            b, a = butter(2, high_pass / (0.5 * sampling_rate), "high")
         else:
-            return [None] * len(signals)
-        
-        for signal in signals:
-            if signal is not None:
-                filtered_signals.append(filtfilt(b, a, signal))
+            print("No filter specified. Returning unfiltered signals.")
+            unfiltered = [self.data[sig] for sig in signals]
+            return unfiltered[0] if len(signals)==1 else unfiltered
+            
+        for signal_name in signals:
+            if signal_name in self.data and self.data[signal_name] is not None:
+                filtered_signals.append(filtfilt(b, a, self.data[signal_name]))
             else:
                 filtered_signals.append(None)
         
-        return filtered_signals
+        return filtered_signals[0] if len(signals)==1 else filtered_signals
     
-    def _downsample_analog(self, signal: np.ndarray) -> np.ndarray:
+    def downsample_analog(self, signal: np.ndarray) -> np.ndarray:
         """Downsample analog signal using specified method."""
         if self.downsample_factor is None or self.downsample_factor == 1:
             return signal
@@ -146,7 +188,7 @@ class Photom:
         else:  # median
             return np.median(shaped, axis=1)
     
-    def _downsample_digital(self, digital: np.ndarray) -> np.ndarray:
+    def downsample_digital(self, digital: np.ndarray) -> np.ndarray:
         """Downsample digital signal by preserving any HIGH values in each bin."""
         if self.downsample_factor is None or self.downsample_factor == 1:
             return digital
@@ -211,90 +253,100 @@ class Photom:
         """Ensure number is odd by adding 1 if necessary."""
         return n if n % 2 == 1 else n + 1
 
-    def _preprocess(self):
+    def preprocess(self):
         """Apply all preprocessing steps to the data."""
         print("Preprocessing data...")
-        self.processed_data = deepcopy(self.data)
-        
-        # Get raw signals
-        signal = self.data[self.signal_channel]
-        control = self.data[self.control_channel]
-        sampling_rate = self.data['sampling_rate']
-        
-        # 1. Apply median filtering if requested
+
+        # Get filtered signals if available
+        signal = self.data[f'{self.signal_channel}_filt'] if f'{self.signal_channel}_filt' in self.data else self.data[self.signal_channel]
+        control = self.data[f'{self.control_channel}_filt'] if f'{self.control_channel}_filt' in self.data else self.data[self.control_channel]
+
+        # Track the latest version of signals
+        current_signal = signal
+        current_control = control
+        current_sampling_rate = self.data['sampling_rate']
+        current_time = self.data['time']
+
+        # 1. Apply median filtering if needed
         if self.median_filter:
-            signal = medfilt(signal, self._ensure_odd(self.median_filter))
-            control = medfilt(control, self._ensure_odd(self.median_filter))
-        
-        # 2. Downsample if requested
+            current_signal = medfilt(current_signal, self._ensure_odd(self.median_filter))
+            current_control = medfilt(current_control, self._ensure_odd(self.median_filter))
+            self.data.update({
+                'signal_med': current_signal,
+                'control_med': current_control
+            })
+
+        # 2. Downsample if needed
         if self.downsample_factor and self.downsample_factor > 1:
             # Downsample analog signals
-            signal = self._downsample_analog(signal)
-            control = self._downsample_analog(control)
+            current_signal = self._downsample_analog(current_signal)
+            current_control = self._downsample_analog(current_control)
             
             # Downsample time
-            time = self._downsample_time(self.data['time'])
+            current_time = self._downsample_time(self.data['time'])
+
+            old_rate = current_sampling_rate
+            current_sampling_rate = current_sampling_rate / self.downsample_factor
             
+            self.data.update({
+                'time': current_time,
+                'original_sampling_rate': old_rate,
+                'sampling_rate': current_sampling_rate
+            })
+
             # Downsample digital signals if present
             for dig_key in ['digital_1', 'digital_2']:
                 if dig_key in self.data and self.data[dig_key] is not None:
-                    self.processed_data[dig_key] = self._downsample_digital(self.data[dig_key])
+                    self.data[dig_key] = self._downsample_digital(self.data[dig_key])
             
             # Adjust digital event times
             for times_key in ['pulse_times_1', 'pulse_times_2']:
                 if times_key in self.data and self.data[times_key] is not None:
-                    self.processed_data[times_key] = self._adjust_digital_events(
+                    self.data[times_key] = self._adjust_digital_events(
                         self.data[times_key],
                         sampling_rate
                     )
             
             # Update time and sampling rate
-            self.processed_data['time'] = time
+            self.data['time'] = time
             sampling_rate = sampling_rate / self.downsample_factor
-            self.processed_data['sampling_rate'] = sampling_rate
-        
-        # # 3. Apply low-pass filtering
-        # b, a = butter(2, self.low_pass, btype="low", fs=sampling_rate)
-        # signal_filt = filtfilt(b, a, signal)
-        # control_filt = filtfilt(b, a, control)
-        signal_filt = signal
-        control_filt = control
+            self.data['sampling_rate'] = sampling_rate
 
-        # 4. Photobleaching correction
-        t = np.arange(len(signal)) / sampling_rate
-        signal_expfit = self._fit_exponential(signal_filt, t, sampling_rate)
-        control_expfit = self._fit_exponential(control_filt, t, sampling_rate)
-        signal_bc = signal_filt - signal_expfit
-        control_bc = control_filt - control_expfit
-        
-        # 5. Motion correction
-        slope, intercept, _, _, _ = linregress(x=control_bc, y=signal_bc)
-        est_motion = intercept + slope * control_bc
-        signal_mc = signal_bc - est_motion
+        # 4. Photobleaching correction if needed
+        if self.bleach_correct:
+            t = np.arange(len(current_signal)) / current_sampling_rate
+            signal_expfit = self._fit_exponential(current_signal, t, current_sampling_rate)
+            control_expfit = self._fit_exponential(current_control, t, current_sampling_rate)
+            
+            current_signal = current_signal - signal_expfit
+            current_control = current_control - control_expfit
+
+            self.data.update({
+                'signal_bc': current_signal,
+                'control_bc': current_control,
+                'signal_expfit': signal_expfit,
+                'control_expfit': control_expfit
+            })
+            
+        # 5. Motion correction if needed
+        if self.motion_correct:
+            slope, intercept, _, _, _ = linregress(x=current_control, y=current_signal)
+            est_motion = intercept + slope * current_control
+            current_signal = current_signal - est_motion
+            
+            self.data.update({'signal_mc': current_signal})
         
         # 6. Normalization
         if self.normalization == "dF/F":
-            signal_norm = 100 * signal_mc / signal_expfit
-        elif self.normalization == "z-score":
-            signal_norm = zscore(signal_mc)
-        else:
-            signal_norm = signal_mc
-        
-        # Store all intermediate and final signals
-        self.processed_data.update({
-            'signal_filt': signal_filt,
-            'signal_bc': signal_bc,
-            'signal_mc': signal_mc,
-            'signal_norm': signal_norm,
-            'control_filt': control_filt,
-            'control_bc': control_bc,
-            'signal_expfit': signal_expfit,
-            'control_expfit': control_expfit,
-        })
-    
-    def get_processed_data(self) -> Dict:
-        """Return the processed data dictionary."""
-        return self.processed_data
+            # Calculate the baseline
+            if 'signal_expfit' in self.data: # Check if we have expfit from bleach correction
+                signal_baseline = self.data['signal_expfit']
+
+            signal_norm = 100 * current_signal / signal_baseline
+            self.data.update({'signal_norm': signal_norm})
+        elif self.normalization == "z-score" or self.normalization == "zscore":
+            signal_norm = zscore(current_signal)
+            self.data.update({'signal_norm': signal_norm})
 
 ####################
 # Helper functions #
