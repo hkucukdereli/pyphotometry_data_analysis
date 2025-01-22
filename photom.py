@@ -156,7 +156,8 @@ class Photom:
                       signals: Union[str, List[str]], 
                       sampling_rate: float = None, 
                       low_pass: float = None, 
-                      high_pass: float = None) -> List[np.ndarray]:
+                      high_pass: float = None,
+                      median: Union[bool, int] = False) -> List[np.ndarray]:
         """Apply specified filters to signals."""
         # Convert single string to list
         if isinstance(signals, str):
@@ -175,9 +176,13 @@ class Photom:
         elif high_pass:
             b, a = butter(2, high_pass / (0.5 * sampling_rate), "high")
         else:
-            print("No filter specified. Returning unfiltered signals.")
-            unfiltered = [self.data[sig] for sig in signals]
-            return unfiltered[0] if len(signals)==1 else unfiltered
+            if median:
+                filtered_signals = [medfilt(self.data[sig], kernel_size=self._ensure_odd(median)) if self.data[sig] is not None else None for sig in signals]
+                return filtered_signals[0] if len(signals)==1 else filtered_signals
+            else:
+                print("No filter specified. Returning unfiltered signals.")
+                unfiltered = [self.data[sig] for sig in signals]
+                return unfiltered[0] if len(signals)==1 else unfiltered
             
         for signal_name in signals:
             if signal_name in self.data and self.data[signal_name] is not None:
