@@ -4,6 +4,8 @@ import json
 import os
 from typing import Union, List, Dict, Optional
 from datetime import datetime
+import pandas as pd
+from datetime import timedelta
 from scipy.signal import medfilt
 from scipy.stats import linregress, zscore
 from scipy.optimize import curve_fit
@@ -79,15 +81,31 @@ class Photom:
         if preprocess:
             # Preprocess the data
             self.preprocess()
+            print("Data preprocessed. See processing_history for details.")
+            self.preprocessed = True
+        else:
+            self.preprocessed = False
+
+        if timeseries:
+            # Generate a range of timestamps based on the start, end, and sampling rate
+            sampling_rate = self.metadata['sampling_rate']
+            dtime = timedelta(seconds=1/sampling_rate)
+            start_timestamp = pd.to_datetime(self.metadata['start_time'])
+            n_samples = len(self.data['time'])
+            end_timestamp = start_timestamp + n_samples * dtime
+            timestamps = pd.date_range(start=start_timestamp, end=end_timestamp - dtime, freq=dtime)
+            self.data['timestamps'] = timestamps
 
             if as_df:
-                if timeseries:
-                    pass
-                else:
-                    pass
+                df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
+                self.data_df = pd.DataFrame(df_dict)
+                self.data_df = self.data_df.set_index('timestamps', drop=True)
+                self.data_df.index.name = None
         else:
-            self.processed_data = None
-    
+            if as_df:
+                df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
+                self.data_df = pd.DataFrame(df_dict)
+
     def _combine_files(self, file_paths: List[str]) -> Dict:
         """Combine multiple PPD files into a single dictionary."""
         combined_data = None
@@ -275,6 +293,8 @@ class Photom:
         # Get filtered signals if available
         signal = self.data[f'{self.signal_channel}_filt'] if f'{self.signal_channel}_filt' in self.data else self.data[self.signal_channel]
         control = self.data[f'{self.control_channel}_filt'] if f'{self.control_channel}_filt' in self.data else self.data[self.control_channel]
+        self.data.pop(self.signal_channel)
+        self.data.pop(self.control_channel)
 
         # Track the latest version of signals
         current_signal = signal
