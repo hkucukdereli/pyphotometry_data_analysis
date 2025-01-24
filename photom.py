@@ -19,13 +19,13 @@ class Photom:
         control_channel: str = "analog_2",
         low_pass: float = None,
         high_pass: float = None,
+        preprocess: bool = False,
         median_filter: Union[bool, int] = False,
         downsample_factor: Optional[int] = None,
         downsample_method: str = "mean",
-        bleach_correct: bool = True,
+        bleach_correct: bool = False,
         motion_correct: bool = True,
         normalization: Optional[str] = "dF/F",
-        preprocess: bool = False,
         timeseries: bool = True,
         as_df: bool = True
     ):
@@ -192,7 +192,7 @@ class Photom:
         
         return filtered_signals[0] if len(signals)==1 else filtered_signals
     
-    def downsample_analog(self, signal: np.ndarray) -> np.ndarray:
+    def _downsample_analog(self, signal: np.ndarray) -> np.ndarray:
         """Downsample analog signal using specified method."""
         if self.downsample_factor is None or self.downsample_factor == 1:
             return signal
@@ -207,10 +207,12 @@ class Photom:
         # Apply downsampling method
         if self.downsample_method == "mean":
             return np.mean(shaped, axis=1)
-        else:  # median
+        elif self.downsample_method == "median":
             return np.median(shaped, axis=1)
+        else:
+            raise ValueError("Invalid downsampling method. Must be 'mean' or 'median'.")
     
-    def downsample_digital(self, digital: np.ndarray) -> np.ndarray:
+    def _downsample_digital(self, digital: np.ndarray) -> np.ndarray:
         """Downsample digital signal by preserving any HIGH values in each bin."""
         if self.downsample_factor is None or self.downsample_factor == 1:
             return digital
