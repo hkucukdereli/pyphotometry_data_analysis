@@ -11,6 +11,9 @@ from scipy.stats import linregress, zscore
 from scipy.optimize import curve_fit
 from scipy.signal import decimate
 
+from scipy.fft import fft, fftfreq
+import matplotlib.pyplot as plt
+
 class Photom:
     def __init__(
         self, 
@@ -27,7 +30,8 @@ class Photom:
         motion_correct: bool = True,
         normalization: Optional[str] = "dF/F",
         timeseries: bool = True,
-        as_df: bool = True
+        as_df: bool = True,
+        verbose: bool = True
     ):
         """
         Initialize Photometry analysis object.
@@ -57,15 +61,33 @@ class Photom:
         self.bleach_correct = bleach_correct
         self.motion_correct = motion_correct
         self.normalization = normalization
+        self.verbose = verbose
         
+        # Initialize processing history
+        self.__init_processing()
+
         # Handle single file path vs list of paths
         if isinstance(file_paths, str):
             self.data, self.metadata = import_ppd(file_paths)
             self.sampling_rate = self.metadata['sampling_rate']
+            # Update processing history
+            self.processing_history.append({
+                'order': self._add_step(),
+                'step': 'data loaded',
+                'multiple files': False,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
         else:
             # Combine multiple files
             self.data, self.metadata = self._combine_files(file_paths)
             self.sampling_rate = self.metadata['sampling_rate']
+            # Update processing history
+            self.processing_history.append({
+                'order': self._add_step(),
+                'step': 'data loaded',
+                'multiple files': True,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
 
         self.data['signal'] = self.data[signal_channel]
         self.data['control'] = self.data[control_channel]
@@ -77,25 +99,19 @@ class Photom:
                                                          low_pass = self.low_pass, 
                                                          high_pass = self.high_pass
                                                          )
-
+        
         if preprocess:
             # Preprocess the data
             self.preprocess()
-            print("Data preprocessed. See processing_history for details.")
+            if self.verbose: print("Data preprocessed. See processing_history for details.")
             self.preprocessed = True
         else:
             self.preprocessed = False
 
         if timeseries:
-            # Generate a range of timestamps based on the start, end, and sampling rate
-            sampling_rate = self.metadata['sampling_rate']
-            dtime = timedelta(seconds=1/sampling_rate)
-            start_timestamp = pd.to_datetime(self.metadata['start_time'])
-            n_samples = len(self.data['time'])
-            end_timestamp = start_timestamp + n_samples * dtime
-            timestamps = pd.date_range(start=start_timestamp, end=end_timestamp - dtime, freq=dtime)
-            self.data['timestamps'] = timestamps
-
+            # Add timestamps to data
+            self._add_timeseries()
+            
             if as_df:
                 df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
                 self.data_df = pd.DataFrame(df_dict)
@@ -106,51 +122,98 @@ class Photom:
                 df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
                 self.data_df = pd.DataFrame(df_dict)
 
-    def _combine_files(self, file_paths: List[str]) -> Dict:
-        """Combine multiple PPD files into a single dictionary."""
-        combined_data = None
+    def _add_timeseries(self):
+        # Combine time arrays monotically
+        if not 'session_id' in self.metadata:
+            start_times = np.repeat(pd.to_datetime(self.metadata['start_time']), len(self.data['time']))
+            time_deltas = np.array([timedelta(milliseconds=t) for t in self.data['time']])
+            self.data['timestamps'] = start_times + time_deltas
+        else:
+            # Create timeseries for each recording session using the start time for each recording
+            session_inds = np.cumsum(np.concatenate([[0], self.metadata['session_len']]))
+            self.data['timestamps'] = []
+            for i, session_id in enumerate(self.metadata['session_id']):
+                time = self.data['time'][session_inds[i]:session_inds[i+1]]
+                start_times = np.repeat(pd.to_datetime(self.metadata['start_time'][i]), len(time))
+                time_deltas = np.array([timedelta(milliseconds=t) for t in time])
+                self.data['timestamps'].append(start_times + time_deltas)
+            self.data['timestamps'] = np.concatenate(self.data['timestamps'])
+    
+    def _combine_files(self, file_paths: List[str],
+                       allow_mixed_modes: bool = False, 
+                       allow_mixed_subjects: bool = False) -> Dict:
         
-        for file_path in file_paths:
-            current_data = self._import_ppd(file_path)
+        metadata_temp = import_metadata(file_paths[0])  # Load metadata from first file
+
+        Data, Metadata = [], []
+        for i, file_path in enumerate(file_paths):
+            data, metadata = import_ppd(file_path)
+            metadata['session_id'] = i + 1  # Assign session ID
+            metadata['session_len'] = len(data['time'])
             
-            if combined_data is None:
-                combined_data = current_data
-                # Store original length for offset calculations
-                original_length = len(current_data['time'])
-            else:
-                # Adjust time array for concatenation
-                time_offset = combined_data['time'][-1]
-                current_data['time'] += time_offset
-                
-                # Concatenate arrays
-                for key in combined_data.keys():
-                    if isinstance(combined_data[key], np.ndarray):
-                        combined_data[key] = np.concatenate([combined_data[key], current_data[key]])
-                    
-                # Adjust pulse times and indices
-                if current_data['pulse_inds_1'] is not None:
-                    combined_data['pulse_inds_1'] = np.concatenate([
-                        combined_data['pulse_inds_1'],
-                        current_data['pulse_inds_1'] + original_length
-                    ])
-                    combined_data['pulse_times_1'] = np.concatenate([
-                        combined_data['pulse_times_1'],
-                        current_data['pulse_times_1'] + time_offset
-                    ])
-                
-                if current_data.get('pulse_inds_2') is not None:
-                    combined_data['pulse_inds_2'] = np.concatenate([
-                        combined_data['pulse_inds_2'],
-                        current_data['pulse_inds_2'] + original_length
-                    ])
-                    combined_data['pulse_times_2'] = np.concatenate([
-                        combined_data['pulse_times_2'],
-                        current_data['pulse_times_2'] + time_offset
-                    ])
-                
-                original_length += len(current_data['time'])
-        
-        return combined_data
+            # Ensure consistency across recordings
+            if metadata_temp['sampling_rate'] != metadata['sampling_rate']:
+                raise ValueError("Concatenating recordings with different sampling rates is not allowed. "
+                                "Load them individually and downsample to the same rate before concatenation.")
+            if not allow_mixed_subjects and metadata_temp['subject_ID'] != metadata['subject_ID']:
+                raise ValueError("You are trying to concatenate recordings from multiple subjects. "
+                                "If intentional, set allow_mixed_subjects=True.")
+            if not allow_mixed_modes and metadata_temp['mode'] != metadata['mode']:
+                raise ValueError("You are trying to concatenate recordings with different modes. "
+                                "If intentional, set allow_mixed_modes=True.")
+
+            Data.append(data)
+            Metadata.append(metadata)
+
+        # Combine metadata
+        combined_metadata = {key: [d[key] for d in Metadata] for key in Metadata[0]}
+        combined_metadata['version'] = np.unique(combined_metadata['version'])[0]
+        combined_metadata['sampling_rate'] = np.unique(combined_metadata['sampling_rate'])[0]
+
+        if not allow_mixed_subjects:
+            combined_metadata['subject_ID'] = np.unique(combined_metadata['subject_ID'])[0]
+        if not allow_mixed_modes:
+            combined_metadata['mode'] = np.unique(combined_metadata['mode'])[0]
+
+        # Find shared keys across all data dictionaries
+        shared_keys = set(Data[0].keys()).intersection(*(d.keys() for d in Data[1:]))
+
+        #####################
+        #### IN PROGRESS ####
+        #####################
+        # # Combine time arrays monotically
+        # time_offset = 0
+        # for i, data in enumerate(Data):
+        #     data['time'] += time_offset
+        #     time_offset = data['time'][-1]
+
+
+        # self._add_timeseries() # Run this instead of the block below
+
+        # # Create timeseries for each recording session using the start time for each recording
+        # for i, metadata in enumerate(Metadata):
+        #     start_time = pd.to_datetime(metadata['start_time'])
+        #     n_samples = len(Data[i]['time'])
+        #     dtime = timedelta(seconds=1/metadata['sampling_rate'])
+        #     timestamps = pd.date_range(start=start_time, end=start_time + n_samples * dtime - dtime, freq=dtime)
+        #     Data[i]['timestamps'] = timestamps
+        # #####################
+        #### IN PROGRESS ####
+        #####################
+
+        # Combine data using shared keys
+        combined_data = {key: np.concatenate([d[key] for d in Data if key in d]) for key in shared_keys}
+
+        return combined_data, combined_metadata
+    
+    def __init_processing(self):
+        # Initialize processing history
+        self.processing_history = []
+        self.__processing_order = 0
+
+    def _add_step(self):
+        self.__processing_order += 1
+        return self.__processing_order
     
     def apply_filters(self, 
                       signals: Union[str, List[str]], 
@@ -180,7 +243,7 @@ class Photom:
                 filtered_signals = [medfilt(self.data[sig], kernel_size=self._ensure_odd(median)) if self.data[sig] is not None else None for sig in signals]
                 return filtered_signals[0] if len(signals)==1 else filtered_signals
             else:
-                print("No filter specified. Returning unfiltered signals.")
+                if self.verbose: print("No filter specified. Returning unfiltered signals.")
                 unfiltered = [self.data[sig] for sig in signals]
                 return unfiltered[0] if len(signals)==1 else unfiltered
             
@@ -189,6 +252,16 @@ class Photom:
                 filtered_signals.append(filtfilt(b, a, self.data[signal_name]))
             else:
                 filtered_signals.append(None)
+
+        # Update processing history
+        self.processing_history.append({
+            'order': self._add_step(),
+            'step': 'filtering',
+            'low pass': low_pass,
+            'high pass': high_pass,
+            'median': median,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
         
         return filtered_signals[0] if len(signals)==1 else filtered_signals
     
@@ -237,18 +310,12 @@ class Photom:
         # Take first time point of each bin
         return time[::self.downsample_factor]
     
-    def _adjust_digital_events(self, event_times: np.ndarray, sampling_rate: float = None) -> np.ndarray:
+    def _adjust_digital_events(self, event_times: np.ndarray) -> np.ndarray:
         """Adjust digital event times after downsampling."""
-        sampling_rate = sampling_rate or self.sampling_rate
-        if sampling_rate <= 0:
-            raise ValueError("Sampling rate must be specified.")
-        
         if self.downsample_factor is None or self.downsample_factor == 1 or event_times is None:
             return event_times
             
-        # Convert to new sampling rate
-        new_sampling_rate = sampling_rate / self.downsample_factor
-        return event_times * sampling_rate / new_sampling_rate
+        return event_times / self.downsample_factor
 
     @staticmethod
     def _double_exponential(t, const, amp_fast, amp_slow, tau_fast, tau_slow):
@@ -291,11 +358,7 @@ class Photom:
         4. Motion correction
         5. Normalization
         """
-        print("Preprocessing data...")
-
-        # Initialize processing history
-        self.processing_history = []
-        processing_order = 0
+        if self.verbose: print("Preprocessing data...")
 
         # Get filtered signals if available
         signal = self.data[f'{self.signal_channel}_filt'] if f'{self.signal_channel}_filt' in self.data else self.data[self.signal_channel]
@@ -321,10 +384,9 @@ class Photom:
             })
 
             # Update processing history
-            processing_order = processing_order + 1
             self.processing_history.append({
-                'order': processing_order,
-                'step': 'median_filter',
+                'order': self._add_step(),
+                'step': 'median filtering',
                 'kernel_size': self.median_filter,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
@@ -343,16 +405,15 @@ class Photom:
             self.sampling_rate = current_sampling_rate
             
             # Add downsampled signals to data
-            self.data.update({
-                'time': current_time,
+            self.data.update({'time': current_time})
+            self.metadata.update({
                 'original_sampling_rate': old_rate,
                 'sampling_rate': current_sampling_rate
             })
 
             # Update processing history
-            processing_order = processing_order + 1
             self.processing_history.append({
-                'order': processing_order,
+                'order': self._add_step(),
                 'step': 'downsample',
                 'factor': self.downsample_factor,
                 'original_sampling_rate': old_rate,
@@ -368,15 +429,12 @@ class Photom:
             # Adjust digital event times
             for times_key in ['pulse_times_1', 'pulse_times_2']:
                 if times_key in self.data and self.data[times_key] is not None:
-                    self.data[times_key] = self._adjust_digital_events(
-                        self.data[times_key],
-                        sampling_rate
-                    )
+                    self.data[times_key] = self._adjust_digital_events(self.data[times_key])
             
             # Update time and sampling rate
-            self.data['time'] = time
-            sampling_rate = sampling_rate / self.downsample_factor
-            self.data['sampling_rate'] = sampling_rate
+            self.data['time'] = current_time
+            self.sampling_rate = self.sampling_rate / self.downsample_factor
+            self.metadata['sampling_rate'] = self.sampling_rate
 
         # 3. Photobleaching correction if needed
         if self.bleach_correct:
@@ -396,9 +454,8 @@ class Photom:
             })
 
             # Update processing history
-            processing_order = processing_order + 1
             self.processing_history.append({
-                'order': processing_order,
+                'order': self._add_step(),
                 'step': 'bleach correction',
                 'method': 'exponential fit',
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -414,9 +471,8 @@ class Photom:
             self.data.update({'signal_mc': current_signal})
 
             # Update processing history
-            processing_order = processing_order + 1
             self.processing_history.append({
-                'order': processing_order,
+                'order': self._add_step(),
                 'step': 'motion correction',
                 'method': 'linear regression',
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -435,14 +491,13 @@ class Photom:
             self.data.update({'signal_norm': signal_norm})
 
         # Update processing history
-        processing_order = processing_order + 1
         self.processing_history.append({
-            'order': processing_order,
+            'order': self._add_step(),
             'step': 'normalization',
             'method': self.normalization,
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
-
+        
 ####################
 # Helper functions #
 ####################
@@ -576,3 +631,43 @@ def extract_pulses(digital_signals: List[np.ndarray], sampling_rate: float) -> D
         pulse_data[f'pulse_times_{i}'] = pulse_times
     
     return pulse_data
+
+def add_zt_columns(df, zt0_hour=18):
+    """
+    Add ZT hour and experimental day columns, with Day 1 starting at first ZT0.
+    Anything before first ZT0 is Day 0.
+    
+    Args:
+        df: DataFrame with a datetime index
+        zt0_hour: Hour of the day when ZT0 starts (default: 18 for 18:00)
+        
+    Returns:
+        DataFrame with added ZT and Day columns
+    """
+    df_with_zt = df.copy()
+    
+    # Calculate ZT hours
+    df_with_zt['ZT'] = (df.index.hour - zt0_hour) % 24
+    
+    # Find first ZT0 timestamp
+    first_zt0_mask = (df.index.hour == zt0_hour)
+    if not any(first_zt0_mask):
+        raise ValueError("No ZT0 found in data")
+    first_zt0 = df.index[first_zt0_mask][0]
+    
+    # Calculate days from first ZT0
+    days_from_zt0 = (df.index.date - first_zt0.date()).astype('timedelta64[D]').astype(int)
+    
+    # Initialize all as Day 0
+    df_with_zt['day'] = 0
+    
+    # Set Day 1 and onwards
+    after_first_zt0_mask = (df.index >= first_zt0)
+    df_with_zt.loc[after_first_zt0_mask, 'day'] = days_from_zt0[after_first_zt0_mask] + 1
+    
+    # Adjust for hours before ZT0 within each day
+    day_adjustment_mask = (df.index > first_zt0) & (df.index.hour < zt0_hour)
+    df_with_zt.loc[day_adjustment_mask, 'day'] -= 1
+    
+    return df_with_zt
+
