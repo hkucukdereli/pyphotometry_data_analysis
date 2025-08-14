@@ -1,18 +1,13 @@
-import numpy as np
-from scipy.signal import butter, filtfilt
-import json
 import os
+import json
+from tqdm import tqdm
 from typing import Union, List, Dict, Optional
-from datetime import datetime
+import numpy as np
 import pandas as pd
-from datetime import timedelta
-from scipy.signal import medfilt
+from datetime import datetime, timedelta
+from scipy.signal import medfilt, butter, filtfilt, decimate
 from scipy.stats import linregress, zscore
 from scipy.optimize import curve_fit
-from scipy.signal import decimate
-
-from scipy.fft import fft, fftfreq
-import matplotlib.pyplot as plt
 
 class Photom:
     def __init__(
@@ -30,6 +25,7 @@ class Photom:
         motion_correct: bool = True,
         normalization: Optional[str] = "dF/F",
         timeseries: bool = True,
+        smooth_timeseries: bool = False,
         as_df: bool = True,
         verbose: bool = True
     ):
@@ -40,15 +36,19 @@ class Photom:
             file_paths: Single file path or list of file paths
             signal_channel: Key for signal channel (default: "analog_1")
             control_channel: Key for control channel (default: "analog_2")
+            low_pass: Low pass filter frequency in Hz
+            high_pass: High pass filter frequency in Hz
             median_filter: Width of median filter window in samples, False to disable
             downsample_factor: Factor by which to temporally downsample the data
             downsample_method: Method for downsampling - "mean" or "median"
-            low_pass: Low pass filter frequency in Hz
-            high_pass: High pass filter frequency in Hz
+            bleach_correct: Whether to apply photobleaching correction (default: False)
+            motion_correct: Whether to apply motion correction (default: True)
             normalization: Type of normalization - "dF/F", "z-score", "zscore", or None
             preprocess: Whether to preprocess the data (default: True). If False, only raw and filtered data is stored.
             timeseries: Whether to return time series data (default: True)
+            smooth_timeseries: Whether to smooth timestamps to the nearest sampling interval (default: False)
             as_df: Whether to return data as a DataFrame (default: True)
+            verbose: Whether to print progress messages (default: True)
         """
         assert downsample_method in ["mean", "median"], "downsample_method must be 'mean' or 'median'"
         self.signal_channel = signal_channel
@@ -110,33 +110,49 @@ class Photom:
 
         if timeseries:
             # Add timestamps to data
-            self._add_timeseries()
+            self._add_timeseries(smooth_timeseries=smooth_timeseries)
             
             if as_df:
+                if self.verbose: print("Contructing the DataFrame...")
                 df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
                 self.data_df = pd.DataFrame(df_dict)
                 self.data_df = self.data_df.set_index('timestamps', drop=True)
                 self.data_df.index.name = None
+                # self.data_df.drop(columns=['time'], inplace=True)
+                self.data_df = self.data_df.sort_index()
+                if self.verbose: print("DataFrame is ready and accessible as Photom.data_df")
         else:
             if as_df:
+                if self.verbose: print("Contructing the DataFrame...")
                 df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
                 self.data_df = pd.DataFrame(df_dict)
+                if self.verbose: print("DataFrame is ready and accessible as Photom.data_df")
 
-    def _add_timeseries(self):
+    def _add_timeseries(self, smooth_timeseries: bool = False):
         # Combine time arrays monotically
         if not 'session_id' in self.metadata:
-            start_times = np.repeat(pd.to_datetime(self.metadata['start_time']), len(self.data['time']))
+            start_time = pd.to_datetime(self.metadata['start_time'])
+            if smooth_timeseries:
+                start_time = smooth_timestamp(start_time, 1000 / self.sampling_rate)
+
+            start_time_list = np.repeat(pd.to_datetime(start_time), len(self.data['time']))
+
             time_deltas = np.array([timedelta(milliseconds=t) for t in self.data['time']])
-            self.data['timestamps'] = start_times + time_deltas
+            self.data['timestamps'] = start_time_list + time_deltas
         else:
             # Create timeseries for each recording session using the start time for each recording
             session_inds = np.cumsum(np.concatenate([[0], self.metadata['session_len']]))
             self.data['timestamps'] = []
             for i, session_id in enumerate(self.metadata['session_id']):
+                start_time = pd.to_datetime(self.metadata['start_time'][i])
+                if smooth_timeseries:
+                    start_time = smooth_timestamp(start_time, 1000 / self.sampling_rate)
+
                 time = self.data['time'][session_inds[i]:session_inds[i+1]]
-                start_times = np.repeat(pd.to_datetime(self.metadata['start_time'][i]), len(time))
+                start_time_list = np.repeat(pd.to_datetime(start_time), len(time))
+
                 time_deltas = np.array([timedelta(milliseconds=t) for t in time])
-                self.data['timestamps'].append(start_times + time_deltas)
+                self.data['timestamps'].append(start_time_list + time_deltas)
             self.data['timestamps'] = np.concatenate(self.data['timestamps'])
     
     def _combine_files(self, file_paths: List[str],
@@ -146,7 +162,7 @@ class Photom:
         metadata_temp = import_metadata(file_paths[0])  # Load metadata from first file
 
         Data, Metadata = [], []
-        for i, file_path in enumerate(file_paths):
+        for i, file_path in tqdm(enumerate(file_paths), total=len(file_paths), desc="Loading files..."):
             data, metadata = import_ppd(file_path)
             metadata['session_id'] = i + 1  # Assign session ID
             metadata['session_len'] = len(data['time'])
@@ -178,29 +194,6 @@ class Photom:
         # Find shared keys across all data dictionaries
         shared_keys = set(Data[0].keys()).intersection(*(d.keys() for d in Data[1:]))
 
-        #####################
-        #### IN PROGRESS ####
-        #####################
-        # # Combine time arrays monotically
-        # time_offset = 0
-        # for i, data in enumerate(Data):
-        #     data['time'] += time_offset
-        #     time_offset = data['time'][-1]
-
-
-        # self._add_timeseries() # Run this instead of the block below
-
-        # # Create timeseries for each recording session using the start time for each recording
-        # for i, metadata in enumerate(Metadata):
-        #     start_time = pd.to_datetime(metadata['start_time'])
-        #     n_samples = len(Data[i]['time'])
-        #     dtime = timedelta(seconds=1/metadata['sampling_rate'])
-        #     timestamps = pd.date_range(start=start_time, end=start_time + n_samples * dtime - dtime, freq=dtime)
-        #     Data[i]['timestamps'] = timestamps
-        # #####################
-        #### IN PROGRESS ####
-        #####################
-
         # Combine data using shared keys
         combined_data = {key: np.concatenate([d[key] for d in Data if key in d]) for key in shared_keys}
 
@@ -214,7 +207,45 @@ class Photom:
     def _add_step(self):
         self.__processing_order += 1
         return self.__processing_order
-    
+
+    def save_processing_history(self, savepath=None):
+        """
+        Save the processing history to a JSON file.
+        
+        Parameters:
+        -----------
+        filename : str, optional
+            The filename or directory to save the history to. 
+            - If None, saves to current script directory with timestamp filename
+            - If directory path, saves in that directory with timestamp filename
+            - If file path, saves to that specific file
+        
+        Returns:
+        --------
+        str
+            The path to the saved JSON file.
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"processing_history_{timestamp}.json"
+        
+        if savepath is None:
+            # Save in current script directory
+            savepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), default_filename)
+        elif os.path.isdir(savepath):
+            # If filename is a directory, save file in that directory
+            savepath = os.path.join(savepath, default_filename)
+
+        # Ensure the directory exists
+        directory = os.path.dirname(savepath)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+        
+        # Write the processing history to the JSON file
+        with open(savepath, 'w') as f:
+            json.dump(self.processing_history, f, indent=2)
+        
+        return savepath
+
     def apply_filters(self, 
                       signals: Union[str, List[str]], 
                       sampling_rate: float = None, 
@@ -501,7 +532,6 @@ class Photom:
 ####################
 # Helper functions #
 ####################
-
 def import_metadata(file_path: str) -> Dict:
     """
     Import metadata from PPD file.
@@ -519,9 +549,6 @@ def import_metadata(file_path: str) -> Dict:
     # Extract header information
     header_dict = json.loads(data_header)
     header_dict["filename"] = os.path.basename(file_path)
-    
-    volts_per_division = header_dict["volts_per_division"]
-    sampling_rate = header_dict["sampling_rate"]
     
     if 'date_time' in header_dict:
         header_dict['start_time'] = header_dict['date_time']
@@ -578,11 +605,6 @@ def import_ppd(file_path: str) -> Dict:
     # Calculate time array
     time = np.arange(analog_1.shape[0]) * 1000 / sampling_rate
     
-    # # Apply filters if specified
-    # analog_1_filt, analog_2_filt, analog_3_filt = self._apply_filters(
-    #     [analog_1, analog_2, analog_3], sampling_rate
-    # )
-    
     # Extract digital pulses
     pulse_data = extract_pulses([digital_1, digital_2], sampling_rate)
     
@@ -590,8 +612,6 @@ def import_ppd(file_path: str) -> Dict:
     data_dict = {
         "analog_1": analog_1,
         "analog_2": analog_2,
-        # "analog_1_filt": analog_1_filt,
-        # "analog_2_filt": analog_2_filt,
         "digital_1": digital_1,
         "digital_2": digital_2,
         **pulse_data,
@@ -601,7 +621,6 @@ def import_ppd(file_path: str) -> Dict:
     if n_analog_signals == 3:
         data_dict.update({
             "analog_3": analog_3,
-            # "analog_3_filt": analog_3_filt,
         })
         
     return data_dict, header_dict
@@ -632,7 +651,7 @@ def extract_pulses(digital_signals: List[np.ndarray], sampling_rate: float) -> D
     
     return pulse_data
 
-def add_zt_columns(df, zt0_hour=18):
+def add_zt_columns(df, zt0_hour=18, fill_gaps=False, smooth=True):
     """
     Add ZT hour and experimental day columns, with Day 1 starting at first ZT0.
     Anything before first ZT0 is Day 0.
@@ -640,34 +659,114 @@ def add_zt_columns(df, zt0_hour=18):
     Args:
         df: DataFrame with a datetime index
         zt0_hour: Hour of the day when ZT0 starts (default: 18 for 18:00)
+        fill_gaps: If True, fills gaps in the time series based on estimated sampling rate
+                   while preserving all original data points
         
     Returns:
         DataFrame with added ZT and Day columns
     """
     df_with_zt = df.copy()
     
-    # Calculate ZT hours
-    df_with_zt['ZT'] = (df.index.hour - zt0_hour) % 24
+    # If fill_gaps is True, estimate sampling rate and fill gaps
+    if fill_gaps:
+        # Sort the index to ensure timestamps are in order
+        df_with_zt = df_with_zt.sort_index()
+        
+        # Calculate time differences between consecutive samples (in milliseconds)
+        time_diffs = df_with_zt.index.to_series().diff().dt.total_seconds() * 1000
+        
+        # Remove NaN (first row) and find the most common difference using the first 1000 samples
+        # or fewer if the dataframe is smaller
+        sample_size = min(1000, len(time_diffs) - 1)
+        common_diffs = time_diffs.iloc[1:sample_size+1]
+        sampling_rate_ms = int(round(common_diffs.median()))
+        
+        print(f"Estimated sampling rate: {1000/sampling_rate_ms}Hz")
+        
+        # Create a new index with regular intervals
+        start_time = df_with_zt.index.min()
+        end_time = df_with_zt.index.max()
+        complete_index = pd.date_range(
+            start=start_time,
+            end=end_time,
+            freq=f'{sampling_rate_ms}ms'
+        )
+        
+        # Create a new dataframe with the complete index
+        df_complete = pd.DataFrame(index=complete_index)
+        
+        # Merge with original data, keeping all original values
+        df_with_zt = df_with_zt.join(df_complete, how='outer')
+        
+        # Sort by timestamp again to ensure proper order
+        df_with_zt = df_with_zt.sort_index()
     
-    # Find first ZT0 timestamp
-    first_zt0_mask = (df.index.hour == zt0_hour)
+    # Calculate ZT hours
+    df_with_zt['ZT'] = (df_with_zt.index.hour - zt0_hour) % 24
+    
+    # Find first ZT0 timestamp using only non-NaN rows for original data
+    # First get a mask of rows that were in the original dataset (any non-NaN value)
+    original_rows = ~df_with_zt.iloc[:, 0].isna() if len(df_with_zt.columns) > 0 else pd.Series(True, index=df_with_zt.index)
+    
+    # Find the first ZT0 among original rows
+    first_zt0_mask = (df_with_zt.index.hour == zt0_hour) & original_rows
+    
     if not any(first_zt0_mask):
         raise ValueError("No ZT0 found in data")
-    first_zt0 = df.index[first_zt0_mask][0]
+    
+    first_zt0 = df_with_zt.index[first_zt0_mask][0]
     
     # Calculate days from first ZT0
-    days_from_zt0 = (df.index.date - first_zt0.date()).astype('timedelta64[D]').astype(int)
+    days_from_zt0 = (df_with_zt.index.date - first_zt0.date()).astype('timedelta64[D]').astype(int)
     
-    # Initialize all as Day 0
+    # Initialize teh day count
     df_with_zt['day'] = 0
     
     # Set Day 1 and onwards
-    after_first_zt0_mask = (df.index >= first_zt0)
+    after_first_zt0_mask = (df_with_zt.index >= first_zt0)
     df_with_zt.loc[after_first_zt0_mask, 'day'] = days_from_zt0[after_first_zt0_mask] + 1
     
     # Adjust for hours before ZT0 within each day
-    day_adjustment_mask = (df.index > first_zt0) & (df.index.hour < zt0_hour)
+    day_adjustment_mask = (df_with_zt.index > first_zt0) & (df_with_zt.index.hour < zt0_hour)
     df_with_zt.loc[day_adjustment_mask, 'day'] -= 1
     
     return df_with_zt
 
+def smooth_timestamp(timestamp, sampling_rate_ms=None):
+    """
+    Smooths a single timestamp to the closest interval based on the sampling rate.
+    
+    Args:
+        timestamp: The timestamp to smooth (pandas Timestamp or compatible datetime)
+        sampling_rate_ms: Sampling rate in milliseconds (default: 100ms)
+    
+    Returns:
+        pandas.Timestamp: The smoothed timestamp
+    """
+    # Convert timestamp to total microseconds
+    seconds = timestamp.second
+    microseconds = timestamp.microsecond
+    total_micros = seconds * 1_000_000 + microseconds
+    
+    # Convert sampling rate to microseconds
+    sampling_micros = sampling_rate_ms * 1000
+    
+    # Round to nearest sampling interval
+    rounded_micros = round(total_micros / sampling_micros) * sampling_micros
+    
+    # Convert back to seconds and microseconds
+    new_seconds = int(rounded_micros // 1_000_000)
+    new_microseconds = int(rounded_micros % 1_000_000)
+    
+    # Create new timestamp
+    smoothed_timestamp = pd.Timestamp(
+        year=timestamp.year,
+        month=timestamp.month,
+        day=timestamp.day,
+        hour=timestamp.hour,
+        minute=timestamp.minute,
+        second=new_seconds,
+        microsecond=new_microseconds
+    )
+    
+    return smoothed_timestamp
