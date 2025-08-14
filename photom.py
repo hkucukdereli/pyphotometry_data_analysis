@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from scipy.signal import medfilt, butter, filtfilt, decimate
 from scipy.stats import linregress, zscore
 from scipy.optimize import curve_fit
+from .fileio import import_metadata, import_ppd, import_csv_pyphotometry, import_csv_neurophotometrics
 
 class Photom:
     def __init__(
@@ -551,100 +552,6 @@ class Photom:
 ####################
 # Helper functions #
 ####################
-
-def import_metadata(file_path: str) -> Dict:
-    """
-    Import metadata from PPD file.
-
-    Args:
-        file_path: Path to PPD file
-
-    Returns:
-        header_dict: Dictionary containing header information
-    """
-    with open(file_path, "rb") as f:
-        header_size = int.from_bytes(f.read(2), "little")
-        data_header = f.read(header_size)
-        
-    # Extract header information
-    header_dict = json.loads(data_header)
-    header_dict["filename"] = os.path.basename(file_path)
-    
-    if 'date_time' in header_dict:
-        header_dict['start_time'] = header_dict['date_time']
-        del header_dict['date_time']
-
-    return header_dict
-
-def import_ppd(file_path: str) -> Dict:
-    """
-    Import single PPD file.
-
-    Args:
-        file_path: Path to PPD file
-
-    Returns:
-        data_dict: Dictionary containing data from PPD file
-        header_dict: Dictionary containing header information
-    """
-    with open(file_path, "rb") as f:
-        header_size = int.from_bytes(f.read(2), "little")
-        data_header = f.read(header_size)
-        data = np.frombuffer(f.read(), dtype=np.dtype("<u2"))
-        
-    # Extract header information
-    header_dict = json.loads(data_header)
-    header_dict["filename"] = os.path.basename(file_path)
-    
-    volts_per_division = header_dict["volts_per_division"]
-    sampling_rate = header_dict["sampling_rate"]
-    
-    if 'date_time' in header_dict:
-        header_dict['start_time'] = header_dict['date_time']
-        del header_dict['date_time']
-
-    # Extract signals
-    analog = data >> 1
-    digital = ((data & 1) == 1).astype(int)
-    
-    # Get number of signals
-    if "n_analog_signals" in header_dict:
-        n_analog_signals = header_dict["n_analog_signals"]
-        n_digital_signals = header_dict["n_digital_signals"]
-    else:
-        n_analog_signals = 2
-        n_digital_signals = 2
-        
-    # Extract individual signals
-    analog_1 = analog[::n_analog_signals] * volts_per_division[0]
-    analog_2 = analog[1::n_analog_signals] * volts_per_division[1]
-    analog_3 = analog[2::n_analog_signals] * volts_per_division[0] if n_analog_signals == 3 else None
-    digital_1 = digital[::n_analog_signals]
-    digital_2 = digital[1::n_analog_signals] if n_digital_signals == 2 else None
-    
-    # Calculate time array
-    time = np.arange(analog_1.shape[0]) * 1000 / sampling_rate
-    
-    # Extract digital pulses
-    pulse_data = extract_pulses([digital_1, digital_2], sampling_rate)
-    
-    # Construct output dictionary
-    data_dict = {
-        "analog_1": analog_1,
-        "analog_2": analog_2,
-        "digital_1": digital_1,
-        "digital_2": digital_2,
-        **pulse_data,
-        "time": time,
-    }
-    
-    if n_analog_signals == 3:
-        data_dict.update({
-            "analog_3": analog_3
-        })
-        
-    return data_dict, header_dict
-
 def extract_pulses(digital_signals: List[np.ndarray], sampling_rate: float) -> Dict:
     """
     Extract pulse times and indices from digital signals.
