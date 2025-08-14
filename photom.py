@@ -13,6 +13,7 @@ class Photom:
     def __init__(
         self, 
         file_paths: Union[str, List[str]],
+        platform: str = "pyphotometry",
         signal_channel: str = "analog_1",
         control_channel: str = "analog_2",
         low_pass: float = None,
@@ -34,6 +35,7 @@ class Photom:
         
         Args:
             file_paths: Single file path or list of file paths
+            platform: Recording platform (default: "pyphotometry")
             signal_channel: Key for signal channel (default: "analog_1")
             control_channel: Key for control channel (default: "analog_2")
             low_pass: Low pass filter frequency in Hz
@@ -51,6 +53,7 @@ class Photom:
             verbose: Whether to print progress messages (default: True)
         """
         assert downsample_method in ["mean", "median"], "downsample_method must be 'mean' or 'median'"
+        self.platform = platform
         self.signal_channel = signal_channel
         self.control_channel = control_channel
         self.low_pass = low_pass
@@ -66,9 +69,10 @@ class Photom:
         # Initialize processing history
         self.__init_processing()
 
+        # Load data
         # Handle single file path vs list of paths
         if isinstance(file_paths, str):
-            self.data, self.metadata = import_ppd(file_paths)
+            self.data, self.metadata = self.import_data(file_paths)
             self.sampling_rate = self.metadata['sampling_rate']
             # Update processing history
             self.processing_history.append({
@@ -127,34 +131,20 @@ class Photom:
                 df_dict = {key:self.data[key] for key in self.data.keys() if len(self.data[key])==len(self.data['time'])}
                 self.data_df = pd.DataFrame(df_dict)
                 if self.verbose: print("DataFrame is ready and accessible as Photom.data_df")
-
-    def _add_timeseries(self, smooth_timeseries: bool = False):
-        # Combine time arrays monotically
-        if not 'session_id' in self.metadata:
-            start_time = pd.to_datetime(self.metadata['start_time'])
-            if smooth_timeseries:
-                start_time = smooth_timestamp(start_time, 1000 / self.sampling_rate)
-
-            start_time_list = np.repeat(pd.to_datetime(start_time), len(self.data['time']))
-
-            time_deltas = np.array([timedelta(milliseconds=t) for t in self.data['time']])
-            self.data['timestamps'] = start_time_list + time_deltas
-        else:
-            # Create timeseries for each recording session using the start time for each recording
-            session_inds = np.cumsum(np.concatenate([[0], self.metadata['session_len']]))
-            self.data['timestamps'] = []
-            for i, session_id in enumerate(self.metadata['session_id']):
-                start_time = pd.to_datetime(self.metadata['start_time'][i])
-                if smooth_timeseries:
-                    start_time = smooth_timestamp(start_time, 1000 / self.sampling_rate)
-
-                time = self.data['time'][session_inds[i]:session_inds[i+1]]
-                start_time_list = np.repeat(pd.to_datetime(start_time), len(time))
-
-                time_deltas = np.array([timedelta(milliseconds=t) for t in time])
-                self.data['timestamps'].append(start_time_list + time_deltas)
-            self.data['timestamps'] = np.concatenate(self.data['timestamps'])
     
+    # File IO methods
+    def import_data(self, file_path: str):
+        """Return the appropriate import function based on file type and platform."""
+        if file_path.endswith(".ppd"):
+            self.platform = "pyphotometry"  # Overwrite the platform if it's a ppd file
+            return import_ppd
+        elif file_path.endswith(".csv") and self.platform == "pyphotometry":
+            return import_csv_pyphotometry
+        elif file_path.endswith(".csv") and self.platform == "neurophotometrics":
+            return import_csv_neurophotometrics
+        else:
+            raise ValueError("Unsupported file type or platform!")
+
     def _combine_files(self, file_paths: List[str],
                        allow_mixed_modes: bool = False, 
                        allow_mixed_subjects: bool = False) -> Dict:
@@ -199,6 +189,7 @@ class Photom:
 
         return combined_data, combined_metadata
     
+    # Processing history methods
     def __init_processing(self):
         # Initialize processing history
         self.processing_history = []
@@ -245,6 +236,33 @@ class Photom:
             json.dump(self.processing_history, f, indent=2)
         
         return savepath
+
+    def _add_timeseries(self, smooth_timeseries: bool = False):
+        # Combine time arrays monotically
+        if not 'session_id' in self.metadata:
+            start_time = pd.to_datetime(self.metadata['start_time'])
+            if smooth_timeseries:
+                start_time = smooth_timestamp(start_time, 1000 / self.sampling_rate)
+
+            start_time_list = np.repeat(pd.to_datetime(start_time), len(self.data['time']))
+
+            time_deltas = np.array([timedelta(milliseconds=t) for t in self.data['time']])
+            self.data['timestamps'] = start_time_list + time_deltas
+        else:
+            # Create timeseries for each recording session using the start time for each recording
+            session_inds = np.cumsum(np.concatenate([[0], self.metadata['session_len']]))
+            self.data['timestamps'] = []
+            for i, session_id in enumerate(self.metadata['session_id']):
+                start_time = pd.to_datetime(self.metadata['start_time'][i])
+                if smooth_timeseries:
+                    start_time = smooth_timestamp(start_time, 1000 / self.sampling_rate)
+
+                time = self.data['time'][session_inds[i]:session_inds[i+1]]
+                start_time_list = np.repeat(pd.to_datetime(start_time), len(time))
+
+                time_deltas = np.array([timedelta(milliseconds=t) for t in time])
+                self.data['timestamps'].append(start_time_list + time_deltas)
+            self.data['timestamps'] = np.concatenate(self.data['timestamps'])
 
     def apply_filters(self, 
                       signals: Union[str, List[str]], 
@@ -379,6 +397,7 @@ class Photom:
         """Ensure number is odd by adding 1 if necessary."""
         return n if n % 2 == 1 else n + 1
 
+    # Method to preprocess the data
     def preprocess(self):
         """Apply all preprocessing steps to the data.
 
@@ -532,6 +551,7 @@ class Photom:
 ####################
 # Helper functions #
 ####################
+
 def import_metadata(file_path: str) -> Dict:
     """
     Import metadata from PPD file.
@@ -620,7 +640,7 @@ def import_ppd(file_path: str) -> Dict:
     
     if n_analog_signals == 3:
         data_dict.update({
-            "analog_3": analog_3,
+            "analog_3": analog_3
         })
         
     return data_dict, header_dict
